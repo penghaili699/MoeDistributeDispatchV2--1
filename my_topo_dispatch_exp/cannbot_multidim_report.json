@@ -1,0 +1,284 @@
+[
+  {
+    "genome": {
+      "gen": 0,
+      "name": "Gen0_32KB_20AIV_Static",
+      "tile_bytes": 32768,
+      "max_aiv": 20,
+      "skew_thresh": 999.0,
+      "desc": "单维基线：32KB UB Tile + 20 AIV 满核 + 静态全走自定义流"
+    },
+    "score": 81.26,
+    "avg_latency_us": 580.16,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 230.01,
+        "cand_us": 281.4,
+        "speedup": 0.817
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 130.39,
+        "cand_us": 182.26,
+        "speedup": 0.715
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 363.44,
+        "cand_us": 901.85,
+        "speedup": 0.403
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 368.4,
+        "cand_us": 877.93,
+        "speedup": 0.42
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 233.13,
+        "cand_us": 287.15,
+        "speedup": 0.812
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 149.58,
+        "cand_us": 197.09,
+        "speedup": 0.759
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 514.93,
+        "cand_us": 956.23,
+        "speedup": 0.539
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 514.03,
+        "cand_us": 957.39,
+        "speedup": 0.537
+      }
+    ]
+  },
+  {
+    "genome": {
+      "gen": 1,
+      "name": "Gen1_32KB_12AIV_Static",
+      "tile_bytes": 32768,
+      "max_aiv": 12,
+      "skew_thresh": 999.0,
+      "desc": "核数裁剪进化：限制并发 AIV 核数为 12，降低小包核间同步与 GM 争用"
+    },
+    "score": 80.45,
+    "avg_latency_us": 592.2,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 224.19,
+        "cand_us": 272.7,
+        "speedup": 0.822
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 142.31,
+        "cand_us": 194.22,
+        "speedup": 0.733
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 349.88,
+        "cand_us": 905.97,
+        "speedup": 0.386
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 372.03,
+        "cand_us": 910.9,
+        "speedup": 0.408
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 217.07,
+        "cand_us": 300.81,
+        "speedup": 0.722
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 138.37,
+        "cand_us": 184.35,
+        "speedup": 0.751
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 523.18,
+        "cand_us": 982.38,
+        "speedup": 0.533
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 509.6,
+        "cand_us": 986.3,
+        "speedup": 0.517
+      }
+    ]
+  },
+  {
+    "genome": {
+      "gen": 2,
+      "name": "Gen2_32KB_16AIV_SkewThresh1.65",
+      "tile_bytes": 32768,
+      "max_aiv": 16,
+      "skew_thresh": 1.65,
+      "desc": "三维联合最优：32KB UB + 16 AIV + 倾斜感知阈值 2.2（大包重度倾斜自动切抗拥塞融合流）"
+    },
+    "score": 80.6,
+    "avg_latency_us": 580.77,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 229.85,
+        "cand_us": 300.48,
+        "speedup": 0.765
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 143.94,
+        "cand_us": 192.09,
+        "speedup": 0.749
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 357.22,
+        "cand_us": 886.39,
+        "speedup": 0.403
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 362.12,
+        "cand_us": 884.61,
+        "speedup": 0.409
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 231.24,
+        "cand_us": 281.79,
+        "speedup": 0.821
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 130.83,
+        "cand_us": 192.58,
+        "speedup": 0.679
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 508.74,
+        "cand_us": 950.0,
+        "speedup": 0.536
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 511.32,
+        "cand_us": 958.23,
+        "speedup": 0.534
+      }
+    ]
+  }
+]

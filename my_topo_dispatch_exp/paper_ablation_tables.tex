@@ -1,0 +1,17 @@
+% 自动生成的 CANNBot 消融实验 LaTeX 表格
+\begin{table}[htbp]
+\centering
+\caption{CANNBot 自动化演进闭环下的 \texttt{MoeDistributeDispatchV2} 消融实验对比（2-NPU Ascend 910\_93）}
+\label{tab:cannbot_ablation}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{llccccccc}
+\toprule
+\textbf{代次} & \textbf{进化策略} & \textbf{UB Tile} & \textbf{精度通过率 (MaxDiff)} & \textbf{小包 ($\alpha=0.0$)} & \textbf{小包 ($\alpha=1.5$)} & \textbf{大包 ($\alpha=0.0$)} & \textbf{大包 ($\alpha=1.5$)} & \textbf{CANNBench 得分} \\
+\midrule
+    Gen 0 & \texttt{Gen0\_Baseline\_32KB\_Tile} & 32 KB & 100\% (0.0) & 183.21 & 181.34 & 872.71 & 942.20 & \textbf{81.45} \\
+    Gen 1 & \texttt{Gen1\_16KB\_L1\_Aligned\_Tile} & 16 KB & 100\% (0.0) & 188.51 & 191.81 & 880.33 & 949.28 & \textbf{80.53} \\
+    Gen 2 & \texttt{Gen2\_64KB\_Burst\_Tile} & 64 KB & 100\% (0.0) & 192.73 & 185.17 & 893.00 & 942.12 & \textbf{81.31} \\
+\bottomrule
+\end{tabular}
+}
+\end{table}

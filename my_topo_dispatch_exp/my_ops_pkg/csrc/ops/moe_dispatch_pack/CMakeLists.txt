@@ -1,0 +1,12 @@
+set(MOE_PACK_KERNEL_SRCS
+    ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/moe_dispatch_pack_kernel.cpp
+)
+set(MOE_PACK_PLUGIN_SRCS
+    ${CMAKE_CURRENT_SOURCE_DIR}/op_plugin/moe_dispatch_pack_plugin.cpp
+)
+register_direct_launch_op(
+    "${MOE_PACK_KERNEL_SRCS}"
+    op_kernel
+    "${MOE_PACK_PLUGIN_SRCS}"
+    op_kernel
+)

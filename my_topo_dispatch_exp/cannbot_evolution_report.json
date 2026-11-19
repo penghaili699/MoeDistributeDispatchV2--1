@@ -1,0 +1,278 @@
+[
+  {
+    "genome": {
+      "gen": 0,
+      "name": "Gen0_Baseline_32KB_Tile",
+      "tile_bytes": 32768,
+      "desc": "初始双缓冲基线 (32KB UB Tile + 顺风车元数据 + 持久化缓冲池)"
+    },
+    "score": 81.45,
+    "avg_latency_us": 569.99,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 226.46,
+        "cand_us": 284.6,
+        "speedup": 0.796
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 135.25,
+        "cand_us": 183.21,
+        "speedup": 0.738
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 353.66,
+        "cand_us": 871.57,
+        "speedup": 0.406
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 365.36,
+        "cand_us": 872.71,
+        "speedup": 0.419
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 236.01,
+        "cand_us": 274.44,
+        "speedup": 0.86
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 132.55,
+        "cand_us": 181.34,
+        "speedup": 0.731
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 509.8,
+        "cand_us": 949.86,
+        "speedup": 0.537
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 513.55,
+        "cand_us": 942.2,
+        "speedup": 0.545
+      }
+    ]
+  },
+  {
+    "genome": {
+      "gen": 1,
+      "name": "Gen1_16KB_L1_Aligned_Tile",
+      "tile_bytes": 16384,
+      "desc": "CANNBot 诊断：大包下 32KB UB 占用导致 MTE2/MTE3 流水线气泡，缩减至 16KB 提升双缓冲切换频率"
+    },
+    "score": 80.53,
+    "avg_latency_us": 574.65,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 218.33,
+        "cand_us": 275.11,
+        "speedup": 0.794
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 132.67,
+        "cand_us": 188.51,
+        "speedup": 0.704
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 366.08,
+        "cand_us": 883.54,
+        "speedup": 0.414
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 365.45,
+        "cand_us": 880.33,
+        "speedup": 0.415
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 216.15,
+        "cand_us": 285.21,
+        "speedup": 0.758
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 136.95,
+        "cand_us": 191.81,
+        "speedup": 0.714
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 513.15,
+        "cand_us": 943.43,
+        "speedup": 0.544
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 513.47,
+        "cand_us": 949.28,
+        "speedup": 0.541
+      }
+    ]
+  },
+  {
+    "genome": {
+      "gen": 2,
+      "name": "Gen2_64KB_Burst_Tile",
+      "tile_bytes": 65536,
+      "desc": "CANNBot 诊断：Hidden=7168 (14KB/token) 下扩大至 64KB UB Tile，实现单次 DMA 突发搬运完整 Token 行"
+    },
+    "score": 81.31,
+    "avg_latency_us": 579.0,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 229.95,
+        "cand_us": 302.54,
+        "speedup": 0.76
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 153.59,
+        "cand_us": 192.73,
+        "speedup": 0.797
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 358.37,
+        "cand_us": 886.68,
+        "speedup": 0.404
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 359.5,
+        "cand_us": 893.0,
+        "speedup": 0.403
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 226.27,
+        "cand_us": 276.36,
+        "speedup": 0.819
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 135.73,
+        "cand_us": 185.17,
+        "speedup": 0.733
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 515.46,
+        "cand_us": 953.43,
+        "speedup": 0.541
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 520.83,
+        "cand_us": 942.12,
+        "speedup": 0.553
+      }
+    ]
+  }
+]

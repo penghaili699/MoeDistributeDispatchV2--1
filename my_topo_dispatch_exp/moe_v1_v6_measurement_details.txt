@@ -1,0 +1,1766 @@
+]633;E;echo "========== 1. 双 NPU 主测试脚本 ==========";428b005a-1811-4ed4-a04b-0e378725038a]633;C========== 1. 双 NPU 主测试脚本 ==========
+import os
+import sys
+import time
+import json
+import yaml
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch_npu
+
+# 加载我们的任务 golden 与候选算子包
+sys.path.insert(0, "/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2")
+import golden
+import cann_bench
+
+def _worker(rank: int, world_size: int, port: int, cases: list, skew_alpha: float, out_queue):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["GRAPH_SKEW_ALPHA"] = str(skew_alpha)
+    os.environ["HCCL_WHITELIST_DISABLE"] = "1"
+
+    torch_npu.npu.set_device(rank)
+    device = torch.device(f"npu:{rank}")
+    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+
+    # 获取底层 HCCL 通信域名（供 MC2 算子使用）
+    pg = dist.group.WORLD
+    if hasattr(pg, "_get_backend"):
+        hccl_backend = pg._get_backend(device)
+        hcomm_info = hccl_backend.get_hccl_comm_name(rank)
+    else:
+        hcomm_info = pg.get_hccl_comm_name(rank)
+
+    ctx = {
+        "rank": rank,
+        "world_size": world_size,
+        "device": device,
+        "torch_npu": torch_npu,
+        "hcomm_info": hcomm_info,
+    }
+
+    results = []
+    for case in cases:
+        payload = {
+            "input_shapes": case["input_shape"],
+            "dtypes": case["dtype"],
+            "value_ranges": case["value_range"],
+            "attrs": case["attrs"],
+        }
+        inputs = golden.mc2_make_rank_inputs(ctx, payload)
+        attrs = case["attrs"]
+
+        # 1. 运行 Golden 参考算子并测时
+        for _ in range(3):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+
+        t0 = time.perf_counter()
+        for _ in range(10):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        ref_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        # 2. 运行我们的候选优化算子并测时
+        for _ in range(3):
+            cand_out = golden.mc2_call_candidate(cann_bench.moe_distribute_dispatch_v2, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+
+        t0 = time.perf_counter()
+        for _ in range(10):
+            cand_out = golden.mc2_call_candidate(cann_bench.moe_distribute_dispatch_v2, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        cand_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        # 3. 精度校验（按实际接收的有效 Token 数量切片对比 expand_x，排除尾部未初始化显存）
+        valid_tokens = int(ref_out[3].sum().item()) if len(ref_out) > 3 else cand_out[0].shape[0]
+        valid_tokens = max(1, min(valid_tokens, cand_out[0].shape[0]))
+        max_diff = float((cand_out[0][:valid_tokens].float() - ref_out[0][:valid_tokens].float()).abs().max().item())
+        passed = max_diff < 1e-2
+
+        if rank == 0:
+            results.append({
+                "case_id": case["case_id"],
+                "note": case["note"],
+                "passed": passed,
+                "max_diff": max_diff,
+                "golden_us": round(ref_us, 2),
+                "cand_us": round(cand_us, 2),
+                "speedup": round(ref_us / max(cand_us, 1e-6), 3),
+            })
+
+    if rank == 0:
+        out_queue.put(results)
+    dist.destroy_process_group()
+
+def run_benchmark(skew_alpha: float):
+    with open("/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2/cases.yaml") as f:
+        cases = yaml.safe_load(f)["cases"]
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    port = 29500 + int(skew_alpha * 10)
+    procs = [ctx.Process(target=_worker, args=(r, 2, port, cases, skew_alpha, q)) for r in range(2)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+
+    res = q.get()
+    print(f"\n==================== 2-NPU HCCL Benchmark (GRAPH_SKEW_ALPHA = {skew_alpha}) ====================")
+    print(f"{'Case':<6} {'Note':<26} {'Pass':<6} {'MaxDiff':<10} {'Golden(us)':<12} {'Cand(us)':<12} {'Speedup':<8}")
+    for r in res:
+        print(f"{r['case_id']:<6} {r['note']:<26} {str(r['passed']):<6} {r['max_diff']:<10.5f} {r['golden_us']:<12.2f} {r['cand_us']:<12.2f} {r['speedup']:<8.3f}x")
+
+if __name__ == "__main__":
+    run_benchmark(0.0)
+    run_benchmark(1.5)
+
+========== 2. 硬件测试脚本 ==========
+import os, sys, time, yaml, torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch_npu
+
+sys.path.insert(0, "/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2")
+import golden
+import cann_bench
+
+_HW_RECV_POOL = {}
+_HW_AUX_POOL = {}
+
+def hw_aligned_candidate(
+    x, expert_ids, group_ep, ep_world_size, ep_rank_id, moe_expert_num,
+    group_tp="", tp_world_size=0, tp_rank_id=0, shared_expert_num=1, shared_expert_rank_num=0,
+    quant_mode=0, global_bs=0, comm_alg="", zero_expert_num=0, copy_expert_num=0,
+    const_expert_num=0, x_active_mask=None, scales=None, expert_scales=None, elastic_info=None,
+):
+    bs, hidden_size = x.shape
+    k = expert_ids.size(1)
+    device = x.device
+    experts_per_rank = moe_expert_num // ep_world_size
+    total_send_tokens = bs * k
+
+    # 硬件对齐紧凑分片：32 行对齐 (32 * 14KB = 448KB 契合 HBM/HCCS 突发包边界)
+    raw_rows = bs * min(k, experts_per_rank) + 1
+    chunk_rows = ((raw_rows + 31) // 32) * 32
+
+    packed_send = torch.ops.cann_bench.moe_hw_pack(x, expert_ids, ep_world_size, moe_expert_num, chunk_rows)
+    recv_key = (device.index, packed_send.shape, packed_send.dtype)
+    recv_buf = _HW_RECV_POOL.get(recv_key)
+    if recv_buf is None:
+        recv_buf = torch.empty_like(packed_send)
+        _HW_RECV_POOL[recv_key] = recv_buf
+    dist.all_to_all_single(recv_buf, packed_send)
+
+    max_capacity = max(ep_world_size * total_send_tokens, global_bs * k if global_bs > 0 else ep_world_size * total_send_tokens)
+    expand_x, ep_recv_counts = torch.ops.cann_bench.moe_hw_unpack(recv_buf, ep_world_size, moe_expert_num, chunk_rows, max_capacity)
+
+    aux_key = (device.index, max_capacity, max(tp_world_size, 1))
+    aux = _HW_AUX_POOL.get(aux_key)
+    if aux is None:
+        aux = (
+            torch.empty((max_capacity,), dtype=torch.float32, device=device),
+            torch.empty((max_capacity * 3,), dtype=torch.int32, device=device),
+            torch.zeros((max(tp_world_size, 1),), dtype=torch.int32, device=device),
+            torch.ones((max_capacity,), dtype=torch.float32, device=device),
+        )
+        _HW_AUX_POOL[aux_key] = aux
+    return expand_x, aux, aux, ep_recv_counts, aux, aux
+
+def _worker(rank, world_size, port, cases, skew_alpha, out_q):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["GRAPH_SKEW_ALPHA"] = str(skew_alpha)
+    os.environ["HCCL_WHITELIST_DISABLE"] = "1"
+    torch_npu.npu.set_device(rank)
+    device = torch.device(f"npu:{rank}")
+    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    pg = dist.group.WORLD
+    hcomm_info = pg._get_backend(device).get_hccl_comm_name(rank) if hasattr(pg, "_get_backend") else pg.get_hccl_comm_name(rank)
+    ctx = {"rank": rank, "world_size": world_size, "device": device, "torch_npu": torch_npu, "hcomm_info": hcomm_info}
+
+    results = []
+    for case in cases:
+        payload = {"input_shapes": case["input_shape"], "dtypes": case["dtype"], "value_ranges": case["value_range"], "attrs": case["attrs"]}
+        inputs = golden.mc2_make_rank_inputs(ctx, payload)
+        attrs = case["attrs"]
+
+        for _ in range(3):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        ref_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        for _ in range(3):
+            cand_out = golden.mc2_call_candidate(hw_aligned_candidate, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            cand_out = golden.mc2_call_candidate(hw_aligned_candidate, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        cand_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        valid_tokens = max(1, min(int(ref_out[3].sum().item()), cand_out[0].shape[0]))
+        max_diff = float((cand_out[0][:valid_tokens].float() - ref_out[0][:valid_tokens].float()).abs().max().item())
+        if rank == 0:
+            results.append({"case_id": case["case_id"], "note": case["note"], "passed": max_diff < 1e-2, "max_diff": max_diff, "golden_us": round(ref_us, 2), "cand_us": round(cand_us, 2), "speedup": round(ref_us / max(cand_us, 1e-6), 3)})
+    if rank == 0:
+        out_q.put(results)
+    dist.destroy_process_group()
+
+def run_bench(alpha):
+    with open("/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2/cases.yaml") as f:
+        cases = yaml.safe_load(f)["cases"]
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_worker, args=(r, 2, 29700 + int(alpha * 10), cases, alpha, q)) for r in range(2)]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    print(f"\n==================== HW-ALIGNED 2-NPU Benchmark (GRAPH_SKEW_ALPHA = {alpha}) ====================")
+    print(f"{'Case':<6} {'Note':<26} {'Pass':<6} {'MaxDiff':<10} {'Golden(us)':<12} {'HW_Opt(us)':<12} {'Speedup':<8}")
+    for r in q.get():
+        print(f"{r['case_id']:<6} {r['note']:<26} {str(r['passed']):<6} {r['max_diff']:<10.5f} {r['golden_us']:<12.2f} {r['cand_us']:<12.2f} {r['speedup']:<8.3f}x")
+
+if __name__ == "__main__":
+    run_bench(0.0)
+    run_bench(1.5)
+
+========== 3. V1 基线测试 ==========
+import os
+import sys
+import time
+import yaml
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch_npu
+
+sys.path.insert(0, "/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2")
+import golden
+
+def v1_pytorch_dispatch_baseline(
+    x, expert_ids, group_ep, ep_world_size, ep_rank_id, moe_expert_num,
+    group_tp="", tp_world_size=0, tp_rank_id=0, shared_expert_num=1, shared_expert_rank_num=0,
+    quant_mode=0, global_bs=0, comm_alg="", zero_expert_num=0, copy_expert_num=0,
+    const_expert_num=0, x_active_mask=None, scales=None, expert_scales=None, elastic_info=None,
+):
+    bs, hidden_size = x.shape
+    k = expert_ids.size(1)
+    device = x.device
+    experts_per_rank = moe_expert_num // ep_world_size
+    total_send_tokens = bs * k
+
+    # 1. 多步 PyTorch 碎片算子计算发送端重排索引
+    flat_experts = expert_ids.reshape(-1)
+    send_expert_counts = torch.bincount(flat_experts, minlength=moe_expert_num).to(torch.int64)
+    _, perm = torch.sort(flat_experts, stable=True)
+    token_indices = torch.div(perm, k, rounding_mode="floor")
+    packed_send = x.index_select(0, token_indices)
+
+    # 2. 第一次全网通信往返 (RTT 1)：交换各专家发送计数 + 强制 D2H .tolist() 同步
+    recv_expert_counts = torch.empty_like(send_expert_counts)
+    dist.all_to_all_single(recv_expert_counts, send_expert_counts)
+
+    recv_matrix = recv_expert_counts.view(ep_world_size, experts_per_rank)
+    send_splits = send_expert_counts.view(ep_world_size, experts_per_rank).sum(dim=1).tolist()
+    recv_splits = recv_matrix.sum(dim=1).tolist()
+    total_recv_tokens = sum(recv_splits)
+
+    max_capacity = max(total_recv_tokens, global_bs * k if global_bs > 0 else bs * ep_world_size * k)
+    expand_x = torch.empty((max_capacity, hidden_size), dtype=x.dtype, device=device)
+
+    # 3. 第二次全网通信往返 (RTT 2)：变长 AlltoAllv + 接收端再次 sort/index_select 重排
+    if total_recv_tokens > 0 or total_send_tokens > 0:
+        recv_buf = torch.empty((total_recv_tokens, hidden_size), dtype=x.dtype, device=device)
+        dist.all_to_all_single(
+            recv_buf, packed_send,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+        )
+        block_ids = torch.arange(moe_expert_num, device=device, dtype=torch.int64)
+        sort_key = (block_ids % experts_per_rank) * ep_world_size + (block_ids // experts_per_rank)
+        token_keys = sort_key[torch.repeat_interleave(block_ids, recv_expert_counts)]
+        _, gather_perm = torch.sort(token_keys, stable=True)
+        expand_x[:total_recv_tokens].copy_(recv_buf.index_select(0, gather_perm))
+
+    dynamic_scales = torch.empty((max_capacity,), dtype=torch.float32, device=device)
+    assist_info = torch.zeros((max_capacity * 3,), dtype=torch.int32, device=device)
+    ep_recv_counts = recv_matrix.sum(dim=0).to(torch.int32)
+    tp_recv_counts = torch.zeros((max(tp_world_size, 1),), dtype=torch.int32, device=device)
+    expand_scales = torch.ones((max_capacity,), dtype=torch.float32, device=device)
+    return expand_x, dynamic_scales, assist_info, ep_recv_counts, tp_recv_counts, expand_scales
+
+def _worker(rank, world_size, port, cases, skew_alpha, out_q):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["GRAPH_SKEW_ALPHA"] = str(skew_alpha)
+    os.environ["HCCL_WHITELIST_DISABLE"] = "1"
+    torch_npu.npu.set_device(rank)
+    device = torch.device(f"npu:{rank}")
+    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    pg = dist.group.WORLD
+    hcomm_info = pg._get_backend(device).get_hccl_comm_name(rank) if hasattr(pg, "_get_backend") else pg.get_hccl_comm_name(rank)
+    ctx = {"rank": rank, "world_size": world_size, "device": device, "torch_npu": torch_npu, "hcomm_info": hcomm_info}
+
+    results = []
+    for case in cases:
+        payload = {"input_shapes": case["input_shape"], "dtypes": case["dtype"], "value_ranges": case["value_range"], "attrs": case["attrs"]}
+        inputs = golden.mc2_make_rank_inputs(ctx, payload)
+        attrs = case["attrs"]
+
+        for _ in range(3):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        ref_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        for _ in range(3):
+            cand_out = golden.mc2_call_candidate(v1_pytorch_dispatch_baseline, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            cand_out = golden.mc2_call_candidate(v1_pytorch_dispatch_baseline, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        cand_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        valid_tokens = max(1, min(int(ref_out[3].sum().item()), cand_out[0].shape[0]))
+        max_diff = float((cand_out[0][:valid_tokens].float() - ref_out[0][:valid_tokens].float()).abs().max().item())
+        if rank == 0:
+            results.append({
+                "case_id": case["case_id"], "note": case["note"], "passed": max_diff < 1e-2,
+                "max_diff": max_diff, "golden_us": round(ref_us, 2), "v1_us": round(cand_us, 2),
+                "speedup": round(ref_us / max(cand_us, 1e-6), 3)
+            })
+    if rank == 0:
+        out_q.put(results)
+    dist.destroy_process_group()
+
+def run_bench(alpha, port):
+    with open("/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2/cases.yaml") as f:
+        cases = yaml.safe_load(f)["cases"]
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_worker, args=(r, 2, port, cases, alpha, q)) for r in range(2)]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    print(f"\n==================== V1 初代基线双卡实测 (GRAPH_SKEW_ALPHA = {alpha}) ====================")
+    print(f"{'Case':<6} {'Note':<26} {'Pass':<6} {'MaxDiff':<10} {'Golden(us)':<12} {'V1_Base(us)':<12} {'Speedup':<8}")
+    for r in q.get():
+        print(f"{r['case_id']:<6} {r['note']:<26} {str(r['passed']):<6} {r['max_diff']:<10.5f} {r['golden_us']:<12.2f} {r['v1_us']:<12.2f} {r['speedup']:<8.3f}x")
+
+if __name__ == "__main__":
+    run_bench(0.0, 29930)
+    run_bench(1.5, 29940)
+
+========== 4. V2 测试 ==========
+import os
+import sys
+import time
+import yaml
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch_npu
+import cann_bench
+
+sys.path.insert(0, "/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2")
+import golden
+
+# =========================================================================
+# 第一部分：单卡纯 Ascend C Kernel (moe_dispatch_pack) 极限吞吐与 HBM 利用率实测
+# =========================================================================
+def bench_single_card_kernel():
+    torch_npu.npu.set_device(0)
+    bs, k, hidden_size = 512, 8, 7168
+    total_tokens = bs * k
+    x = torch.randn(bs, hidden_size, dtype=torch.bfloat16, device="npu:0")
+    dst_idx = torch.arange(total_tokens, dtype=torch.int32, device="npu:0").view(bs, k)
+
+    # 5 次预热 + 30 次计时取平均
+    for _ in range(5):
+        _ = torch.ops.cann_bench.moe_dispatch_pack(x, dst_idx, total_tokens)
+    torch_npu.npu.synchronize()
+
+    iters = 30
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        _ = torch.ops.cann_bench.moe_dispatch_pack(x, dst_idx, total_tokens)
+    torch_npu.npu.synchronize()
+    kernel_us = (time.perf_counter() - t0) / iters * 1e6
+
+    # 计算搬运体积与带宽利用率
+    one_way_bytes = total_tokens * hidden_size * 2          # 4096 * 7168 * 2B = 58.72 MB
+    two_way_bytes = one_way_bytes * 2                       # 1读 + 1写 = 117.44 MB
+    one_way_tbs = (one_way_bytes / (kernel_us * 1e-6)) / 1e12
+    two_way_tbs = (two_way_bytes / (kernel_us * 1e-6)) / 1e12
+    hbm_util = (two_way_tbs / 3.20) * 100.0                 # dav-2201 单 Die 理论峰值 HBM 带宽 3.20 TB/s
+
+    print("\n================ 1. 单卡纯 Ascend C Kernel 极限吞吐实测 ================")
+    print(f"测试负载: bs={bs}, k={k}, hidden={hidden_size} (bfloat16) | 单向有效数据量: {one_way_bytes / 1e6:.2f} MB")
+    print(f"纯 Kernel 耗时: {kernel_us:.2f} us")
+    print(f"单向有效吞吐:   {one_way_tbs:.2f} TB/s | 双向读写总带宽: {two_way_tbs:.2f} TB/s")
+    print(f"HBM 带宽利用率: {hbm_util:.1f}% (基于单 Die 3.20 TB/s 理论峰值)")
+
+# =========================================================================
+# 第二部分：V2 阶段双卡完整调度 (双向自定义 Kernel + 双次通信) 实测
+# =========================================================================
+def v2_kernel_dispatch(
+    x, expert_ids, group_ep, ep_world_size, ep_rank_id, moe_expert_num,
+    group_tp="", tp_world_size=0, tp_rank_id=0, shared_expert_num=1, shared_expert_rank_num=0,
+    quant_mode=0, global_bs=0, comm_alg="", zero_expert_num=0, copy_expert_num=0,
+    const_expert_num=0, x_active_mask=None, scales=None, expert_scales=None, elastic_info=None,
+):
+    bs, hidden_size = x.shape
+    k = expert_ids.size(1)
+    device = x.device
+    experts_per_rank = moe_expert_num // ep_world_size
+    total_send_tokens = bs * k
+
+    flat_experts = expert_ids.reshape(-1)
+    send_expert_counts = torch.bincount(flat_experts, minlength=moe_expert_num).to(torch.int64)
+    sorted_experts, perm = torch.sort(flat_experts, stable=True)
+    expert_offsets = torch.cumsum(send_expert_counts, dim=0) - send_expert_counts
+    local_rank_in_expert = torch.arange(total_send_tokens, device=device, dtype=torch.int64) - expert_offsets[sorted_experts]
+    dst_slots_flat = torch.empty_like(flat_experts, dtype=torch.int32)
+    dst_slots_flat[perm] = (expert_offsets[sorted_experts] + local_rank_in_expert).to(torch.int32)
+
+    # 调用自定义 Ascend C 多核双缓冲 Scatter-Pack Kernel
+    packed_send = torch.ops.cann_bench.moe_dispatch_pack(x, dst_slots_flat.view(bs, k), total_send_tokens)
+
+    recv_expert_counts = torch.empty_like(send_expert_counts)
+    dist.all_to_all_single(recv_expert_counts, send_expert_counts)
+
+    recv_matrix = recv_expert_counts.view(ep_world_size, experts_per_rank)
+    send_splits = send_expert_counts.view(ep_world_size, experts_per_rank).sum(dim=1).tolist()
+    recv_splits = recv_matrix.sum(dim=1).tolist()
+    total_recv_tokens = sum(recv_splits)
+
+    max_capacity = max(total_recv_tokens, global_bs * k if global_bs > 0 else bs * ep_world_size * k)
+    expand_x = torch.empty((max_capacity, hidden_size), dtype=x.dtype, device=device)
+
+    if total_recv_tokens > 0 or total_send_tokens > 0:
+        recv_buf = torch.empty((total_recv_tokens, hidden_size), dtype=x.dtype, device=device)
+        dist.all_to_all_single(
+            recv_buf, packed_send,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+        )
+        block_ids = torch.arange(moe_expert_num, device=device, dtype=torch.int64)
+        sort_key = (block_ids % experts_per_rank) * ep_world_size + (block_ids // experts_per_rank)
+        token_keys = sort_key[torch.repeat_interleave(block_ids, recv_expert_counts)]
+        _, gather_perm = torch.sort(token_keys, stable=True)
+
+        # 调用自定义 Ascend C 多核双缓冲 Gather-Unpack Kernel
+        torch.ops.cann_bench.moe_dispatch_gather(recv_buf, gather_perm.to(torch.int32), expand_x[:total_recv_tokens])
+
+    dynamic_scales = torch.empty((max_capacity,), dtype=torch.float32, device=device)
+    assist_info = torch.zeros((max_capacity * 3,), dtype=torch.int32, device=device)
+    ep_recv_counts = recv_matrix.sum(dim=0).to(torch.int32)
+    tp_recv_counts = torch.zeros((max(tp_world_size, 1),), dtype=torch.int32, device=device)
+    expand_scales = torch.ones((max_capacity,), dtype=torch.float32, device=device)
+    return expand_x, dynamic_scales, assist_info, ep_recv_counts, tp_recv_counts, expand_scales
+
+def _worker(rank, world_size, port, cases, skew_alpha, out_q):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["GRAPH_SKEW_ALPHA"] = str(skew_alpha)
+    os.environ["HCCL_WHITELIST_DISABLE"] = "1"
+    torch_npu.npu.set_device(rank)
+    device = torch.device(f"npu:{rank}")
+    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    pg = dist.group.WORLD
+    hcomm_info = pg._get_backend(device).get_hccl_comm_name(rank) if hasattr(pg, "_get_backend") else pg.get_hccl_comm_name(rank)
+    ctx = {"rank": rank, "world_size": world_size, "device": device, "torch_npu": torch_npu, "hcomm_info": hcomm_info}
+
+    results = []
+    for case in cases:
+        payload = {"input_shapes": case["input_shape"], "dtypes": case["dtype"], "value_ranges": case["value_range"], "attrs": case["attrs"]}
+        inputs = golden.mc2_make_rank_inputs(ctx, payload)
+        attrs = case["attrs"]
+
+        for _ in range(3):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        ref_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        for _ in range(3):
+            cand_out = golden.mc2_call_candidate(v2_kernel_dispatch, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            cand_out = golden.mc2_call_candidate(v2_kernel_dispatch, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        cand_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        valid_tokens = max(1, min(int(ref_out[3].sum().item()), cand_out[0].shape[0]))
+        max_diff = float((cand_out[0][:valid_tokens].float() - ref_out[0][:valid_tokens].float()).abs().max().item())
+        if rank == 0:
+            results.append({
+                "case_id": case["case_id"], "note": case["note"], "passed": max_diff < 1e-2,
+                "max_diff": max_diff, "golden_us": round(ref_us, 2), "v2_us": round(cand_us, 2),
+                "speedup": round(ref_us / max(cand_us, 1e-6), 3)
+            })
+    if rank == 0:
+        out_q.put(results)
+    dist.destroy_process_group()
+
+def run_v2_2npu(alpha, port):
+    with open("/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2/cases.yaml") as f:
+        cases = yaml.safe_load(f)["cases"]
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_worker, args=(r, 2, port, cases, alpha, q)) for r in range(2)]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    print(f"\n================ 2. V2 双缓冲 Kernel 双卡端到端实测 (GRAPH_SKEW_ALPHA = {alpha}) ================")
+    print(f"{'Case':<6} {'Note':<26} {'Pass':<6} {'MaxDiff':<10} {'Golden(us)':<12} {'V2_Kern(us)':<12} {'Speedup':<8}")
+    for r in q.get():
+        print(f"{r['case_id']:<6} {r['note']:<26} {str(r['passed']):<6} {r['max_diff']:<10.5f} {r['golden_us']:<12.2f} {r['v2_us']:<12.2f} {r['speedup']:<8.3f}x")
+
+if __name__ == "__main__":
+    bench_single_card_kernel()
+    run_v2_2npu(0.0, 29950)
+    run_v2_2npu(1.5, 29960)
+
+========== 5. V3 测试 ==========
+import os
+import sys
+import time
+import yaml
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch_npu
+import cann_bench
+
+sys.path.insert(0, "/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2")
+import golden
+
+# =========================================================================
+# V3 阶段调度逻辑：核内直方图融合 + 顺风车元数据 + 单次定长 AlltoAll (动态分配缓冲)
+# =========================================================================
+def v3_piggyback_dispatch(
+    x, expert_ids, group_ep, ep_world_size, ep_rank_id, moe_expert_num,
+    group_tp="", tp_world_size=0, tp_rank_id=0, shared_expert_num=1, shared_expert_rank_num=0,
+    quant_mode=0, global_bs=0, comm_alg="", zero_expert_num=0, copy_expert_num=0,
+    const_expert_num=0, x_active_mask=None, scales=None, expert_scales=None, elastic_info=None,
+):
+    bs, hidden_size = x.shape
+    k = expert_ids.size(1)
+    device = x.device
+    total_send_tokens = bs * k
+    chunk_rows = total_send_tokens + 1  # 末尾预留 1 行顺风车携带专家计数元数据
+
+    # 1. 自定义 Ascend C Kernel 1：核内直方图 + 顺风车写入元数据行 + 多核双缓冲打包
+    packed_send = torch.ops.cann_bench.moe_e2e_pack(x, expert_ids, ep_world_size, moe_expert_num, chunk_rows)
+
+    # 2. 单次定长 AlltoAll 通信（V3 阶段每次动态分配接收缓冲区，对比 V4 静态持久化缓冲池）
+    recv_buf = torch.empty((ep_world_size * chunk_rows, hidden_size), dtype=x.dtype, device=device)
+    dist.all_to_all_single(recv_buf, packed_send)
+
+    # 3. 自定义 Ascend C Kernel 2：读取顺风车计数 + 多核双缓冲解包写入最终专家主序
+    max_capacity = max(ep_world_size * total_send_tokens, global_bs * k if global_bs > 0 else ep_world_size * total_send_tokens)
+    expand_x, ep_recv_counts = torch.ops.cann_bench.moe_e2e_unpack(
+        recv_buf, ep_world_size, moe_expert_num, chunk_rows, max_capacity
+    )
+
+    # V3 阶段尚未加入 V4 持久化辅助张量池，每次动态分配辅助输出
+    dynamic_scales = torch.empty((max_capacity,), dtype=torch.float32, device=device)
+    assist_info = torch.zeros((max_capacity * 3,), dtype=torch.int32, device=device)
+    tp_recv_counts = torch.zeros((max(tp_world_size, 1),), dtype=torch.int32, device=device)
+    expand_scales = torch.ones((max_capacity,), dtype=torch.float32, device=device)
+
+    return expand_x, dynamic_scales, assist_info, ep_recv_counts, tp_recv_counts, expand_scales
+
+def _worker(rank, world_size, port, cases, skew_alpha, out_q):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["GRAPH_SKEW_ALPHA"] = str(skew_alpha)
+    os.environ["HCCL_WHITELIST_DISABLE"] = "1"
+    torch_npu.npu.set_device(rank)
+    device = torch.device(f"npu:{rank}")
+    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    pg = dist.group.WORLD
+    hcomm_info = pg._get_backend(device).get_hccl_comm_name(rank) if hasattr(pg, "_get_backend") else pg.get_hccl_comm_name(rank)
+    ctx = {"rank": rank, "world_size": world_size, "device": device, "torch_npu": torch_npu, "hcomm_info": hcomm_info}
+
+    results = []
+    for case in cases:
+        payload = {"input_shapes": case["input_shape"], "dtypes": case["dtype"], "value_ranges": case["value_range"], "attrs": case["attrs"]}
+        inputs = golden.mc2_make_rank_inputs(ctx, payload)
+        attrs = case["attrs"]
+
+        for _ in range(3):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        ref_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        for _ in range(3):
+            cand_out = golden.mc2_call_candidate(v3_piggyback_dispatch, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            cand_out = golden.mc2_call_candidate(v3_piggyback_dispatch, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        cand_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        valid_tokens = max(1, min(int(ref_out[3].sum().item()), cand_out[0].shape[0]))
+        max_diff = float((cand_out[0][:valid_tokens].float() - ref_out[0][:valid_tokens].float()).abs().max().item())
+        if rank == 0:
+            results.append({
+                "case_id": case["case_id"], "note": case["note"], "passed": max_diff < 1e-2,
+                "max_diff": max_diff, "golden_us": round(ref_us, 2), "v3_us": round(cand_us, 2),
+                "speedup": round(ref_us / max(cand_us, 1e-6), 3)
+            })
+    if rank == 0:
+        out_q.put(results)
+    dist.destroy_process_group()
+
+def run_v3_2npu(alpha, port):
+    with open("/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2/cases.yaml") as f:
+        cases = yaml.safe_load(f)["cases"]
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_worker, args=(r, 2, port, cases, alpha, q)) for r in range(2)]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    print(f"\n==================== V3 顺风车元数据协议双卡实测 (GRAPH_SKEW_ALPHA = {alpha}) ====================")
+    print(f"{'Case':<6} {'Note':<26} {'Pass':<6} {'MaxDiff':<10} {'Golden(us)':<12} {'V3_Pigg(us)':<12} {'Speedup':<8}")
+    for r in q.get():
+        print(f"{r['case_id']:<6} {r['note']:<26} {str(r['passed']):<6} {r['max_diff']:<10.5f} {r['golden_us']:<12.2f} {r['v3_us']:<12.2f} {r['speedup']:<8.3f}x")
+
+if __name__ == "__main__":
+    run_v3_2npu(0.0, 29980)
+    run_v3_2npu(1.5, 29990)
+
+========== 6. V4 测试 ==========
+import os
+import sys
+import time
+import yaml
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch_npu
+import cann_bench
+
+sys.path.insert(0, "/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2")
+import golden
+
+# =========================================================================
+# V4 阶段完整调度：调用 C++ 静态持久化缓冲池 (g_pack_pool / g_expand_pool)
+# 搭配 Python 持久化接收/辅助张量池 (_RECV_POOL / _AUX_POOL)
+# =========================================================================
+def _worker(rank, world_size, port, cases, skew_alpha, out_q):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["GRAPH_SKEW_ALPHA"] = str(skew_alpha)
+    os.environ["HCCL_WHITELIST_DISABLE"] = "1"
+    torch_npu.npu.set_device(rank)
+    device = torch.device(f"npu:{rank}")
+    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    pg = dist.group.WORLD
+    hcomm_info = pg._get_backend(device).get_hccl_comm_name(rank) if hasattr(pg, "_get_backend") else pg.get_hccl_comm_name(rank)
+    ctx = {"rank": rank, "world_size": world_size, "device": device, "torch_npu": torch_npu, "hcomm_info": hcomm_info}
+
+    results = []
+    for case in cases:
+        payload = {"input_shapes": case["input_shape"], "dtypes": case["dtype"], "value_ranges": case["value_range"], "attrs": case["attrs"]}
+        inputs = golden.mc2_make_rank_inputs(ctx, payload)
+        attrs = case["attrs"]
+
+        for _ in range(3):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        ref_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        # 调用主工程固化在 cann_bench.moe_distribute_dispatch_v2 中的 V4 持久化缓冲池版本
+        for _ in range(3):
+            cand_out = golden.mc2_call_candidate(cann_bench.moe_distribute_dispatch_v2, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            cand_out = golden.mc2_call_candidate(cann_bench.moe_distribute_dispatch_v2, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        cand_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        valid_tokens = max(1, min(int(ref_out[3].sum().item()), cand_out[0].shape[0]))
+        max_diff = float((cand_out[0][:valid_tokens].float() - ref_out[0][:valid_tokens].float()).abs().max().item())
+        if rank == 0:
+            results.append({
+                "case_id": case["case_id"], "note": case["note"], "passed": max_diff < 1e-2,
+                "max_diff": max_diff, "golden_us": round(ref_us, 2), "v4_us": round(cand_us, 2),
+                "speedup": round(ref_us / max(cand_us, 1e-6), 3)
+            })
+    if rank == 0:
+        out_q.put(results)
+    dist.destroy_process_group()
+
+def run_v4_2npu(alpha, port):
+    with open("/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2/cases.yaml") as f:
+        cases = yaml.safe_load(f)["cases"]
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_worker, args=(r, 2, port, cases, alpha, q)) for r in range(2)]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    print(f"\n==================== V4 静态持久化缓冲池双卡实测 (GRAPH_SKEW_ALPHA = {alpha}) ====================")
+    print(f"{'Case':<6} {'Note':<26} {'Pass':<6} {'MaxDiff':<10} {'Golden(us)':<12} {'V4_Pool(us)':<12} {'Speedup':<8}")
+    for r in q.get():
+        print(f"{r['case_id']:<6} {r['note']:<26} {str(r['passed']):<6} {r['max_diff']:<10.5f} {r['golden_us']:<12.2f} {r['v4_us']:<12.2f} {r['speedup']:<8.3f}x")
+
+if __name__ == "__main__":
+    run_v4_2npu(0.0, 30010)
+    run_v4_2npu(1.5, 30020)
+
+========== 7. V5 测试 ==========
+import os, sys, time, yaml, torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch_npu
+
+sys.path.insert(0, "/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2")
+import golden
+import cann_bench
+
+_HW_RECV_POOL = {}
+_HW_AUX_POOL = {}
+
+def hw_aligned_candidate(
+    x, expert_ids, group_ep, ep_world_size, ep_rank_id, moe_expert_num,
+    group_tp="", tp_world_size=0, tp_rank_id=0, shared_expert_num=1, shared_expert_rank_num=0,
+    quant_mode=0, global_bs=0, comm_alg="", zero_expert_num=0, copy_expert_num=0,
+    const_expert_num=0, x_active_mask=None, scales=None, expert_scales=None, elastic_info=None,
+):
+    bs, hidden_size = x.shape
+    k = expert_ids.size(1)
+    device = x.device
+    experts_per_rank = moe_expert_num // ep_world_size
+    total_send_tokens = bs * k
+
+    # 硬件对齐紧凑分片：32 行对齐 (32 * 14KB = 448KB 契合 HBM/HCCS 突发包边界)
+    raw_rows = bs * min(k, experts_per_rank) + 1
+    chunk_rows = ((raw_rows + 31) // 32) * 32
+
+    packed_send = torch.ops.cann_bench.moe_hw_pack(x, expert_ids, ep_world_size, moe_expert_num, chunk_rows)
+    recv_key = (device.index, packed_send.shape, packed_send.dtype)
+    recv_buf = _HW_RECV_POOL.get(recv_key)
+    if recv_buf is None:
+        recv_buf = torch.empty_like(packed_send)
+        _HW_RECV_POOL[recv_key] = recv_buf
+    dist.all_to_all_single(recv_buf, packed_send)
+
+    max_capacity = max(ep_world_size * total_send_tokens, global_bs * k if global_bs > 0 else ep_world_size * total_send_tokens)
+    expand_x, ep_recv_counts = torch.ops.cann_bench.moe_hw_unpack(recv_buf, ep_world_size, moe_expert_num, chunk_rows, max_capacity)
+
+    aux_key = (device.index, max_capacity, max(tp_world_size, 1))
+    aux = _HW_AUX_POOL.get(aux_key)
+    if aux is None:
+        aux = (
+            torch.empty((max_capacity,), dtype=torch.float32, device=device),
+            torch.empty((max_capacity * 3,), dtype=torch.int32, device=device),
+            torch.zeros((max(tp_world_size, 1),), dtype=torch.int32, device=device),
+            torch.ones((max_capacity,), dtype=torch.float32, device=device),
+        )
+        _HW_AUX_POOL[aux_key] = aux
+    return expand_x, aux, aux, ep_recv_counts, aux, aux
+
+def _worker(rank, world_size, port, cases, skew_alpha, out_q):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["GRAPH_SKEW_ALPHA"] = str(skew_alpha)
+    os.environ["HCCL_WHITELIST_DISABLE"] = "1"
+    torch_npu.npu.set_device(rank)
+    device = torch.device(f"npu:{rank}")
+    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    pg = dist.group.WORLD
+    hcomm_info = pg._get_backend(device).get_hccl_comm_name(rank) if hasattr(pg, "_get_backend") else pg.get_hccl_comm_name(rank)
+    ctx = {"rank": rank, "world_size": world_size, "device": device, "torch_npu": torch_npu, "hcomm_info": hcomm_info}
+
+    results = []
+    for case in cases:
+        payload = {"input_shapes": case["input_shape"], "dtypes": case["dtype"], "value_ranges": case["value_range"], "attrs": case["attrs"]}
+        inputs = golden.mc2_make_rank_inputs(ctx, payload)
+        attrs = case["attrs"]
+
+        for _ in range(3):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        ref_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        for _ in range(3):
+            cand_out = golden.mc2_call_candidate(hw_aligned_candidate, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            cand_out = golden.mc2_call_candidate(hw_aligned_candidate, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        cand_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        valid_tokens = max(1, min(int(ref_out[3].sum().item()), cand_out[0].shape[0]))
+        max_diff = float((cand_out[0][:valid_tokens].float() - ref_out[0][:valid_tokens].float()).abs().max().item())
+        if rank == 0:
+            results.append({"case_id": case["case_id"], "note": case["note"], "passed": max_diff < 1e-2, "max_diff": max_diff, "golden_us": round(ref_us, 2), "cand_us": round(cand_us, 2), "speedup": round(ref_us / max(cand_us, 1e-6), 3)})
+    if rank == 0:
+        out_q.put(results)
+    dist.destroy_process_group()
+
+def run_bench(alpha):
+    with open("/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2/cases.yaml") as f:
+        cases = yaml.safe_load(f)["cases"]
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_worker, args=(r, 2, 29700 + int(alpha * 10), cases, alpha, q)) for r in range(2)]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    print(f"\n==================== HW-ALIGNED 2-NPU Benchmark (GRAPH_SKEW_ALPHA = {alpha}) ====================")
+    print(f"{'Case':<6} {'Note':<26} {'Pass':<6} {'MaxDiff':<10} {'Golden(us)':<12} {'HW_Opt(us)':<12} {'Speedup':<8}")
+    for r in q.get():
+        print(f"{r['case_id']:<6} {r['note']:<26} {str(r['passed']):<6} {r['max_diff']:<10.5f} {r['golden_us']:<12.2f} {r['cand_us']:<12.2f} {r['speedup']:<8.3f}x")
+
+if __name__ == "__main__":
+    run_bench(0.0)
+    run_bench(1.5)
+
+========== 8. V6 测试 ==========
+import os, sys, time, yaml, torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch_npu
+
+sys.path.insert(0, "/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2")
+import golden
+import cann_bench
+
+_BG_RECV_POOL = {}
+_BG_AUX_POOL = {}
+
+def beat_golden_candidate(
+    x, expert_ids, group_ep, ep_world_size, ep_rank_id, moe_expert_num,
+    group_tp="", tp_world_size=0, tp_rank_id=0, shared_expert_num=1, shared_expert_rank_num=0,
+    quant_mode=0, global_bs=0, comm_alg="", zero_expert_num=0, copy_expert_num=0,
+    const_expert_num=0, x_active_mask=None, scales=None, expert_scales=None, elastic_info=None,
+):
+    bs, hidden_size = x.shape
+    k = expert_ids.size(1)
+    device = x.device
+    experts_per_rank = moe_expert_num // ep_world_size
+    total_send_tokens = bs * k
+    stride_rows = ((bs * min(k, experts_per_rank) + 1 + 15) // 16) * 16
+
+    packed_send, _ = torch.ops.cann_bench.moe_bg_pack(x, expert_ids, ep_world_size, moe_expert_num, stride_rows)
+    recv_key = (device.index, packed_send.shape, packed_send.dtype)
+    recv_buf = _BG_RECV_POOL.get(recv_key)
+    if recv_buf is None:
+        recv_buf = torch.empty_like(packed_send)
+        _BG_RECV_POOL[recv_key] = recv_buf
+    dist.all_to_all_single(recv_buf, packed_send)
+
+    max_capacity = max(ep_world_size * total_send_tokens, global_bs * k if global_bs > 0 else ep_world_size * total_send_tokens)
+    expand_x, ep_recv_counts = torch.ops.cann_bench.moe_bg_unpack(recv_buf, ep_world_size, moe_expert_num, stride_rows, max_capacity)
+
+    aux_key = (device.index, max_capacity, max(tp_world_size, 1))
+    aux = _BG_AUX_POOL.get(aux_key)
+    if aux is None:
+        aux = (
+            torch.empty((max_capacity,), dtype=torch.float32, device=device),
+            torch.empty((max_capacity * 3,), dtype=torch.int32, device=device),
+            torch.zeros((max(tp_world_size, 1),), dtype=torch.int32, device=device),
+            torch.ones((max_capacity,), dtype=torch.float32, device=device),
+        )
+        _BG_AUX_POOL[aux_key] = aux
+    return expand_x, aux, aux, ep_recv_counts, aux, aux
+
+def _worker(rank, world_size, port, cases, skew_alpha, out_q):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["GRAPH_SKEW_ALPHA"] = str(skew_alpha)
+    os.environ["HCCL_WHITELIST_DISABLE"] = "1"
+    torch_npu.npu.set_device(rank)
+    device = torch.device(f"npu:{rank}")
+    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    pg = dist.group.WORLD
+    hcomm_info = pg._get_backend(device).get_hccl_comm_name(rank) if hasattr(pg, "_get_backend") else pg.get_hccl_comm_name(rank)
+    ctx = {"rank": rank, "world_size": world_size, "device": device, "torch_npu": torch_npu, "hcomm_info": hcomm_info}
+
+    results = []
+    for case in cases:
+        payload = {"input_shapes": case["input_shape"], "dtypes": case["dtype"], "value_ranges": case["value_range"], "attrs": case["attrs"]}
+        inputs = golden.mc2_make_rank_inputs(ctx, payload)
+        attrs = case["attrs"]
+
+        for _ in range(3):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            ref_out = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        ref_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        for _ in range(3):
+            cand_out = golden.mc2_call_candidate(beat_golden_candidate, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            cand_out = golden.mc2_call_candidate(beat_golden_candidate, ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        cand_us = (time.perf_counter() - t0) / 10.0 * 1e6
+
+        valid_tokens = max(1, min(int(ref_out[3].sum().item()), cand_out[0].shape[0]))
+        max_diff = float((cand_out[0][:valid_tokens].float() - ref_out[0][:valid_tokens].float()).abs().max().item())
+        if rank == 0:
+            results.append({"case_id": case["case_id"], "note": case["note"], "passed": max_diff < 1e-2, "max_diff": max_diff, "golden_us": round(ref_us, 2), "cand_us": round(cand_us, 2), "speedup": round(ref_us / max(cand_us, 1e-6), 3)})
+    if rank == 0:
+        out_q.put(results)
+    dist.destroy_process_group()
+
+def run_bench(alpha):
+    with open("/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2/cases.yaml") as f:
+        cases = yaml.safe_load(f)["cases"]
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_worker, args=(r, 2, 29800 + int(alpha * 10), cases, alpha, q)) for r in range(2)]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    print(f"\n==================== BEAT-GOLDEN 2-NPU Benchmark (GRAPH_SKEW_ALPHA = {alpha}) ====================")
+    print(f"{'Case':<6} {'Note':<26} {'Pass':<6} {'MaxDiff':<10} {'Golden(us)':<12} {'BG_Opt(us)':<12} {'Speedup':<8}")
+    for r in q.get():
+        print(f"{r['case_id']:<6} {r['note']:<26} {str(r['passed']):<6} {r['max_diff']:<10.5f} {r['golden_us']:<12.2f} {r['cand_us']:<12.2f} {r['speedup']:<8.3f}x")
+
+if __name__ == "__main__":
+    run_bench(0.0)
+    run_bench(1.5)
+
+========== 9. 倾斜测试 ==========
+import os
+import sys
+import time
+import yaml
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch_npu
+
+sys.path.insert(0, "/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2")
+import golden
+
+def _worker(rank, world_size, port, cases, skew_alpha, out_q):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["GRAPH_SKEW_ALPHA"] = str(skew_alpha)
+    os.environ["HCCL_WHITELIST_DISABLE"] = "1"
+    torch_npu.npu.set_device(rank)
+    device = torch.device(f"npu:{rank}")
+    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    pg = dist.group.WORLD
+    hcomm_info = pg._get_backend(device).get_hccl_comm_name(rank) if hasattr(pg, "_get_backend") else pg.get_hccl_comm_name(rank)
+    ctx = {"rank": rank, "world_size": world_size, "device": device, "torch_npu": torch_npu, "hcomm_info": hcomm_info}
+
+    res = {}
+    for case in cases:
+        payload = {"input_shapes": case["input_shape"], "dtypes": case["dtype"], "value_ranges": case["value_range"], "attrs": case["attrs"]}
+        inputs = golden.mc2_make_rank_inputs(ctx, payload)
+        attrs = case["attrs"]
+
+        # 3 次预热 + 15 次实测取平均
+        for _ in range(3):
+            _ = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+
+        t0 = time.perf_counter()
+        for _ in range(15):
+            _ = golden.mc2_distributed_golden(ctx, inputs, attrs)
+        torch_npu.npu.synchronize()
+        dist.barrier()
+        avg_us = (time.perf_counter() - t0) / 15.0 * 1e6
+
+        if rank == 0:
+            res[case["case_id"]] = (case["note"], round(avg_us, 2))
+    if rank == 0:
+        out_q.put(res)
+    dist.destroy_process_group()
+
+def measure_alpha(alpha, port):
+    with open("/mnt/workspace/my_topo_dispatch_exp/my_bench_root/level4/moe_distribute_dispatch_v2/cases.yaml") as f:
+        cases = yaml.safe_load(f)["cases"]
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_worker, args=(r, 2, port, cases, alpha, q)) for r in range(2)]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    return q.get()
+
+if __name__ == "__main__":
+    print("正在双卡实测官方算子 (npu_moe_distribute_dispatch_v2) 在不同负载倾斜度下的延迟...")
+    r_uniform = measure_alpha(0.0, 29910)
+    r_skewed = measure_alpha(1.5, 29920)
+
+    print("\n================ 官方算子负载倾斜退化对比表 ================")
+    print(f"{'Case':<6} {'测试场景':<26} {'均匀 Alpha=0.0 (us)':<22} {'倾斜 Alpha=1.5 (us)':<22} {'延迟退化幅度':<12}")
+    for cid in sorted(r_uniform.keys()):
+        note, u_us = r_uniform[cid]
+        _, s_us = r_skewed[cid]
+        deg = (s_us - u_us) / u_us * 100.0
+        print(f"{cid:<6} {note:<26} {u_us:<22.2f} {s_us:<22.2f} {deg:+.1f}%")
+
+========== 10. CANNBot 迭代流程 ==========
+import re
+import json
+import time
+import subprocess
+
+KERNEL_PATH = "my_ops_pkg/csrc/ops/moe_dispatch_e2e/op_kernel/moe_dispatch_e2e_kernel.cpp"
+INIT_PATH = "my_ops_pkg/cann_bench/__init__.py"
+
+MULTI_DIM_GENOMES = [
+    {
+        "gen": 0,
+        "name": "Gen0_32KB_20AIV_Static",
+        "tile_bytes": 32768,
+        "max_aiv": 20,
+        "skew_thresh": 999.0,
+        "desc": "单维基线：32KB UB Tile + 20 AIV 满核 + 静态全走自定义流",
+    },
+    {
+        "gen": 1,
+        "name": "Gen1_32KB_12AIV_Static",
+        "tile_bytes": 32768,
+        "max_aiv": 12,
+        "skew_thresh": 999.0,
+        "desc": "核数裁剪进化：限制并发 AIV 核数为 12，降低小包核间同步与 GM 争用",
+    },
+    {
+        "gen": 2,
+        "name": "Gen2_32KB_16AIV_SkewThresh1.65",
+        "tile_bytes": 32768,
+        "max_aiv": 16,
+        "skew_thresh": 1.65,
+        "desc": "三维联合最优：32KB UB + 16 AIV + 倾斜感知阈值 2.2（大包重度倾斜自动切抗拥塞融合流）",
+    },
+]
+
+def apply_genome(g):
+    with open(KERNEL_PATH, "r") as f:
+        kcode = f.read()
+    kcode = re.sub(r"constexpr static int64_t MAX_TILE_BYTES = \d+;",
+                   f"constexpr static int64_t MAX_TILE_BYTES = {g['tile_bytes']};", kcode)
+    kcode = re.sub(r"return coreNum > 0 \? [^;]+;",
+                   f"return coreNum > 0 ? (coreNum < {g['max_aiv']} ? coreNum : {g['max_aiv']}) : {g['max_aiv']};", kcode)
+    with open(KERNEL_PATH, "w") as f:
+        f.write(kcode)
+
+    with open(INIT_PATH, "r") as f:
+        icode = f.read()
+    icode = re.sub(r"MAX_AIV_CAP = \d+", f"MAX_AIV_CAP = {g['max_aiv']}", icode)
+    icode = re.sub(r"SKEW_ADAPTIVE_THRESHOLD = [0-9.]+", f"SKEW_ADAPTIVE_THRESHOLD = {g['skew_thresh']}", icode)
+    with open(INIT_PATH, "w") as f:
+        f.write(icode)
+
+def build_and_install():
+    cmd = (
+        "cd my_ops_pkg && bash build.sh >/dev/null 2>&1 && "
+        "pip install dist/cann_bench*.whl --force-reinstall --no-deps --user >/dev/null 2>&1 && cd .. && "
+        "SITE_PKG=$(python3 -c 'import cann_bench, os; print(os.path.dirname(cann_bench.__file__))') && "
+        "cp my_ops_pkg/cann_bench/__init__.py \"$SITE_PKG/__init__.py\""
+    )
+    return subprocess.run(cmd, shell=True).returncode == 0
+
+def run_cannbench_eval():
+    out = subprocess.check_output(["python3", "run_2npu_bench.py"], stderr=subprocess.STDOUT, text=True)
+    metrics = []
+    cur_alpha = None
+    for line in out.splitlines():
+        m_a = re.search(r"GRAPH_SKEW_ALPHA = ([0-9.]+)", line)
+        if m_a:
+            cur_alpha = float(m_a.group(1))
+        m_r = re.match(r"^(\d+)\s+(\S+)\s+(True|False)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*x", line.strip())
+        if m_r:
+            metrics.append({
+                "alpha": cur_alpha,
+                "case_id": int(m_r.group(1)),
+                "note": m_r.group(2),
+                "passed": m_r.group(3) == "True",
+                "max_diff": float(m_r.group(4)),
+                "golden_us": float(m_r.group(5)),
+                "cand_us": float(m_r.group(6)),
+                "speedup": float(m_r.group(7)),
+            })
+    return metrics
+
+def compute_score(metrics):
+    if not metrics:
+        return 0.0
+    pass_rate = sum(1 for m in metrics if m["passed"]) / len(metrics)
+    if pass_rate < 1.0:
+        return round(50.0 * pass_rate, 2)
+    avg_sp = sum(m["speedup"] for m in metrics) / len(metrics)
+    return round(50.0 + 50.0 * min(avg_sp, 1.5), 2)
+
+def main():
+    print("=================================================================")
+    print("  CANNBot 三维联合设计空间搜索启动 (Tile × AIV_Blocks × Skew_Thresh)")
+    print("=================================================================\n")
+    history, best_g, best_score = [], None, -1.0
+
+    for g in MULTI_DIM_GENOMES:
+        print(f">>> [三维进化 Gen {g['gen']}] {g['name']}")
+        print(f"    基因参数: Tile={g['tile_bytes']//1024}KB | MaxAIV={g['max_aiv']} | SkewThresh={g['skew_thresh']}")
+        print(f"    策略动机: {g['desc']}")
+        apply_genome(g)
+
+        t0 = time.time()
+        if not build_and_install():
+            print("    [Error] 编译失败，跳过本代。\n")
+            continue
+        print(f"    编译部署成功 ({time.time() - t0:.1f}s)，运行双卡多倾斜评测...")
+
+        metrics = run_cannbench_eval()
+        score = compute_score(metrics)
+        avg_lat = sum(m["cand_us"] for m in metrics) / max(len(metrics), 1)
+        print(f"    [综合评分] Pass={all(m['passed'] for m in metrics)} | 平均延迟={avg_lat:.2f} us | CANNBench 得分={score}/100")
+        for m in metrics:
+            if m["case_id"] in (2, 4):
+                print(f"      - (Alpha={m['alpha']}) {m['note']}: Cand={m['cand_us']}us vs Golden={m['golden_us']}us (Speedup={m['speedup']}x)")
+        print()
+
+        history.append({"genome": g, "score": score, "avg_latency_us": round(avg_lat, 2), "metrics": metrics})
+        if score > best_score:
+            best_score, best_g = score, g
+
+    if best_g:
+        print("=================================================================")
+        print(f"  三维搜索收敛！最优组合: {best_g['name']} (最高得分: {best_score}/100)")
+        print("=================================================================")
+        apply_genome(best_g)
+        build_and_install()
+
+    with open("cannbot_multidim_report.json", "w") as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
+    print("三维进化报告已保存至: cannbot_multidim_report.json")
+
+if __name__ == "__main__":
+    main()
+
+========== 11. 实验报告文件 ==========
+--- cann bot_evolution_report.json ---
+[
+  {
+    "genome": {
+      "gen": 0,
+      "name": "Gen0_Baseline_32KB_Tile",
+      "tile_bytes": 32768,
+      "desc": "初始双缓冲基线 (32KB UB Tile + 顺风车元数据 + 持久化缓冲池)"
+    },
+    "score": 81.45,
+    "avg_latency_us": 569.99,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 226.46,
+        "cand_us": 284.6,
+        "speedup": 0.796
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 135.25,
+        "cand_us": 183.21,
+        "speedup": 0.738
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 353.66,
+        "cand_us": 871.57,
+        "speedup": 0.406
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 365.36,
+        "cand_us": 872.71,
+        "speedup": 0.419
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 236.01,
+        "cand_us": 274.44,
+        "speedup": 0.86
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 132.55,
+        "cand_us": 181.34,
+        "speedup": 0.731
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 509.8,
+        "cand_us": 949.86,
+        "speedup": 0.537
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 513.55,
+        "cand_us": 942.2,
+        "speedup": 0.545
+      }
+    ]
+  },
+  {
+    "genome": {
+      "gen": 1,
+      "name": "Gen1_16KB_L1_Aligned_Tile",
+      "tile_bytes": 16384,
+      "desc": "CANNBot 诊断：大包下 32KB UB 占用导致 MTE2/MTE3 流水线气泡，缩减至 16KB 提升双缓冲切换频率"
+    },
+    "score": 80.53,
+    "avg_latency_us": 574.65,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 218.33,
+        "cand_us": 275.11,
+        "speedup": 0.794
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 132.67,
+        "cand_us": 188.51,
+        "speedup": 0.704
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 366.08,
+        "cand_us": 883.54,
+        "speedup": 0.414
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 365.45,
+        "cand_us": 880.33,
+        "speedup": 0.415
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 216.15,
+        "cand_us": 285.21,
+        "speedup": 0.758
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 136.95,
+        "cand_us": 191.81,
+        "speedup": 0.714
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 513.15,
+        "cand_us": 943.43,
+        "speedup": 0.544
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 513.47,
+        "cand_us": 949.28,
+        "speedup": 0.541
+      }
+    ]
+  },
+  {
+    "genome": {
+      "gen": 2,
+      "name": "Gen2_64KB_Burst_Tile",
+      "tile_bytes": 65536,
+      "desc": "CANNBot 诊断：Hidden=7168 (14KB/token) 下扩大至 64KB UB Tile，实现单次 DMA 突发搬运完整 Token 行"
+    },
+    "score": 81.31,
+    "avg_latency_us": 579.0,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 229.95,
+        "cand_us": 302.54,
+        "speedup": 0.76
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 153.59,
+        "cand_us": 192.73,
+        "speedup": 0.797
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 358.37,
+        "cand_us": 886.68,
+        "speedup": 0.404
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 359.5,
+        "cand_us": 893.0,
+        "speedup": 0.403
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 226.27,
+        "cand_us": 276.36,
+        "speedup": 0.819
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 135.73,
+        "cand_us": 185.17,
+        "speedup": 0.733
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 515.46,
+        "cand_us": 953.43,
+        "speedup": 0.541
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 520.83,
+        "cand_us": 942.12,
+        "speedup": 0.553
+      }
+    ]
+  }
+]
+--- cann bot_multidim_report.json ---
+[
+  {
+    "genome": {
+      "gen": 0,
+      "name": "Gen0_32KB_20AIV_Static",
+      "tile_bytes": 32768,
+      "max_aiv": 20,
+      "skew_thresh": 999.0,
+      "desc": "单维基线：32KB UB Tile + 20 AIV 满核 + 静态全走自定义流"
+    },
+    "score": 81.26,
+    "avg_latency_us": 580.16,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 230.01,
+        "cand_us": 281.4,
+        "speedup": 0.817
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 130.39,
+        "cand_us": 182.26,
+        "speedup": 0.715
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 363.44,
+        "cand_us": 901.85,
+        "speedup": 0.403
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 368.4,
+        "cand_us": 877.93,
+        "speedup": 0.42
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 233.13,
+        "cand_us": 287.15,
+        "speedup": 0.812
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 149.58,
+        "cand_us": 197.09,
+        "speedup": 0.759
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 514.93,
+        "cand_us": 956.23,
+        "speedup": 0.539
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 514.03,
+        "cand_us": 957.39,
+        "speedup": 0.537
+      }
+    ]
+  },
+  {
+    "genome": {
+      "gen": 1,
+      "name": "Gen1_32KB_12AIV_Static",
+      "tile_bytes": 32768,
+      "max_aiv": 12,
+      "skew_thresh": 999.0,
+      "desc": "核数裁剪进化：限制并发 AIV 核数为 12，降低小包核间同步与 GM 争用"
+    },
+    "score": 80.45,
+    "avg_latency_us": 592.2,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 224.19,
+        "cand_us": 272.7,
+        "speedup": 0.822
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 142.31,
+        "cand_us": 194.22,
+        "speedup": 0.733
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 349.88,
+        "cand_us": 905.97,
+        "speedup": 0.386
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 372.03,
+        "cand_us": 910.9,
+        "speedup": 0.408
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 217.07,
+        "cand_us": 300.81,
+        "speedup": 0.722
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 138.37,
+        "cand_us": 184.35,
+        "speedup": 0.751
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 523.18,
+        "cand_us": 982.38,
+        "speedup": 0.533
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 509.6,
+        "cand_us": 986.3,
+        "speedup": 0.517
+      }
+    ]
+  },
+  {
+    "genome": {
+      "gen": 2,
+      "name": "Gen2_32KB_16AIV_SkewThresh1.65",
+      "tile_bytes": 32768,
+      "max_aiv": 16,
+      "skew_thresh": 1.65,
+      "desc": "三维联合最优：32KB UB + 16 AIV + 倾斜感知阈值 2.2（大包重度倾斜自动切抗拥塞融合流）"
+    },
+    "score": 80.6,
+    "avg_latency_us": 580.77,
+    "metrics": [
+      {
+        "alpha": 0.0,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 229.85,
+        "cand_us": 300.48,
+        "speedup": 0.765
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 143.94,
+        "cand_us": 192.09,
+        "speedup": 0.749
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 357.22,
+        "cand_us": 886.39,
+        "speedup": 0.403
+      },
+      {
+        "alpha": 0.0,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 362.12,
+        "cand_us": 884.61,
+        "speedup": 0.409
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 1,
+        "note": "2npu_uniform_flat_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 231.24,
+        "cand_us": 281.79,
+        "speedup": 0.821
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 2,
+        "note": "2npu_uniform_hier_small",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 130.83,
+        "cand_us": 192.58,
+        "speedup": 0.679
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 3,
+        "note": "2npu_heavy_flat_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 508.74,
+        "cand_us": 950.0,
+        "speedup": 0.536
+      },
+      {
+        "alpha": 1.5,
+        "case_id": 4,
+        "note": "2npu_heavy_hier_large",
+        "passed": true,
+        "max_diff": 0.0,
+        "golden_us": 511.32,
+        "cand_us": 958.23,
+        "speedup": 0.534
+      }
+    ]
+  }
+]

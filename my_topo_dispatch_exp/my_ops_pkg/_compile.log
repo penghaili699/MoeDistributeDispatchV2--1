@@ -1,0 +1,139 @@
+[INFO] Auto-detected SoC: ascend910_93
+=== Building cann_bench wheel package ===
+NPU_ARCH: ascend910_93
+=== Building wheel package ===
+/opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/wheel/bdist_wheel.py:4: FutureWarning: The 'wheel' package is no longer the canonical location of the 'bdist_wheel' command, and will be removed in a future release. Please update to setuptools v70.1 or later which contains an integrated version of this command.
+  warn(
+INFO: running clean
+INFO: Cleaned.
+* Getting build dependencies for wheel...
+/opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/wheel/bdist_wheel.py:4: FutureWarning: The 'wheel' package is no longer the canonical location of the 'bdist_wheel' command, and will be removed in a future release. Please update to setuptools v70.1 or later which contains an integrated version of this command.
+  warn(
+INFO: running egg_info
+INFO: creating cann_bench.egg-info
+INFO: writing cann_bench.egg-info/PKG-INFO
+INFO: writing dependency_links to cann_bench.egg-info/dependency_links.txt
+INFO: writing requirements to cann_bench.egg-info/requires.txt
+INFO: writing top-level names to cann_bench.egg-info/top_level.txt
+INFO: writing manifest file 'cann_bench.egg-info/SOURCES.txt'
+INFO: reading manifest file 'cann_bench.egg-info/SOURCES.txt'
+INFO: writing manifest file 'cann_bench.egg-info/SOURCES.txt'
+* Building wheel...
+/opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/wheel/bdist_wheel.py:4: FutureWarning: The 'wheel' package is no longer the canonical location of the 'bdist_wheel' command, and will be removed in a future release. Please update to setuptools v70.1 or later which contains an integrated version of this command.
+  warn(
+INFO: running bdist_wheel
+INFO: running cmake_build
+/opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch_npu/utils/_path_manager.py:66: UserWarning: Permission mismatch: The owner of /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch_npu/lib/libop_plugin_atb.so does not match.
+  warnings.warn(f"Permission mismatch: The owner of {path} does not match.")
+INFO: get env ASCEND_HOME_PATH = /home/developer/Ascend/cann-9.1.0
+INFO: get env NPU_ARCH = ascend910_93
+INFO: Torch: /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch/share/cmake/Torch
+INFO: Torch NPU: /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch_npu
+INFO: NPU_ARCH: ascend910_93
+INFO: get env PATH = /home/developer/.local/share/opencode/bin:/home/developer/.git-ai/bin:/home/developer/.opencode/bin:/opt/buildtools/Python-3.11.4/bin:/home/developer/Ascend/cann-9.1.0/bin:/home/developer/Ascend/cann-9.1.0/tools/ccec_compiler/bin:/home/developer/Ascend/cann-9.1.0/tools/profiler/bin:/home/developer/Ascend/cann-9.1.0/tools/ascend_system_advisor/asys:/home/developer/Ascend/cann-9.1.0/tools/show_kernel_debug_data:/home/developer/Ascend/cann-9.1.0/tools/msobjdump:/home/developer/.nvm/versions/node/v18.19.1/bin:/home/developer/.opencode/bin:/opt/buildtools/Python-3.11.4/bin:/home/developer/.local/bin:/home/developer/bin:/usr/local/cmake/bin:/opt/buildtools/python-3.11.4/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/jvm/default-java/bin
+-- The C compiler identification is GNU 9.4.0
+-- The CXX compiler identification is GNU 9.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Using Ascend toolkit path: /home/developer/Ascend/cann-9.1.0
+-- Bisheng compiler path: /home/developer/Ascend/cann-9.1.0/aarch64-linux/ccec_compiler/bin/bisheng
+-- Found Python3: /opt/buildtools/Python-3.11.4/bin/python3 (found version "3.11.4") found components: Interpreter Development Development.Module Development.Embed 
+-- Found Python3: /opt/buildtools/Python-3.11.4/bin/python3 (found version 3.11.4)
+-- Python3 include dir: /opt/buildtools/Python-3.11.4/include/python3.11
+-- Python3 libraries: /opt/buildtools/Python-3.11.4/lib/libpython3.11.so
+-- Using Torch path: /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch/share/cmake/Torch
+CMake Warning at /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:22 (message):
+  static library kineto_LIBRARY-NOTFOUND not found.
+Call Stack (most recent call first):
+  /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:125 (append_torchlib_if_found)
+  cmake/torch.cmake:13 (find_package)
+  CMakeLists.txt:23 (include)
+
+
+-- Found Torch: /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch/lib/libtorch.so  
+-- Found Torch version: 2.7.1
+-- Torch include dirs: /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch/include;/opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch/include/torch/csrc/api/include
+-- Torch libraries: torch;torch_library;/opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch/lib/libc10.so
+-- Using Torch NPU path: /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch_npu
+-- Torch NPU include path: /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch_npu/include
+-- Torch NPU lib path: /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch_npu/lib
+-- NPU_ARCH: ascend910_93 -> Bisheng --npu-arch=dav-2201
+-- Adding op directory: add
+-- Registering direct launch op: add
+-- Registered add: kernel=/mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/add/op_kernel/add_kernel.cpp, plugin=/mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/add/op_plugin/add_plugin.cpp
+-- Adding op directory: sqrt
+-- Registering direct launch op: sqrt
+-- Registered sqrt: kernel=/mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/sqrt/op_kernel/sqrt_kernel.cpp, plugin=/mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/sqrt/op_plugin/sqrt_plugin.cpp
+-- Registered kernel sources: /mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/add/op_kernel/add_kernel.cpp;/mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/sqrt/op_kernel/sqrt_kernel.cpp
+-- Registered kernel include dirs: /mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/add/op_kernel;/mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/sqrt/op_kernel
+-- Registered plugin sources: /mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/add/op_plugin/add_plugin.cpp;/mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/sqrt/op_plugin/sqrt_plugin.cpp
+-- Registered plugin include dirs: /mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/add/op_kernel;/mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/csrc/ops/sqrt/op_kernel
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/build
+[ 16%] Building CXX object CMakeFiles/all_kernels_obj.dir/csrc/ops/add/op_kernel/add_kernel.cpp.o
+[ 33%] Building CXX object CMakeFiles/all_plugins_obj.dir/csrc/ops/add/op_plugin/add_plugin.cpp.o
+[ 66%] Building CXX object CMakeFiles/all_kernels_obj.dir/csrc/ops/sqrt/op_kernel/sqrt_kernel.cpp.o
+[ 66%] Building CXX object CMakeFiles/all_plugins_obj.dir/csrc/ops/sqrt/op_plugin/sqrt_plugin.cpp.o
+WARNING: kernel type of __global__ func: void add_kernel<float>(unsigned char*, unsigned char*, unsigned char*, long, long, unsigned int) is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: void add_kernel<half>(unsigned char*, unsigned char*, unsigned char*, long, long, unsigned int) is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: void add_kernel<int>(unsigned char*, unsigned char*, unsigned char*, long, long, unsigned int) is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: void add_kernel<float>(unsigned char*, unsigned char*, unsigned char*, long, long, unsigned int) is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: void add_kernel<half>(unsigned char*, unsigned char*, unsigned char*, long, long, unsigned int) is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: void add_kernel<int>(unsigned char*, unsigned char*, unsigned char*, long, long, unsigned int) is not marked. auto type derivate may be failed.
+[ 66%] Built target all_kernels_obj
+[ 66%] Built target all_plugins_obj
+[ 83%] Building CXX object CMakeFiles/_C.dir/csrc/extension.cpp.o
+[100%] Linking CXX shared library _C.abi3.so
+Copying compiled extension to cann_bench/
+[100%] Built target _C
+INFO: CMake build complete.
+INFO: running build
+INFO: running build_py
+INFO: creating build/lib.linux-aarch64-cpython-311/cann_bench
+INFO: copying cann_bench/__init__.py -> build/lib.linux-aarch64-cpython-311/cann_bench
+INFO: copying cann_bench/_C.abi3.so -> build/lib.linux-aarch64-cpython-311/cann_bench
+INFO: running build_ext
+INFO: installing to build/bdist.linux-aarch64/wheel
+INFO: running install
+INFO: running install_lib
+INFO: creating build/bdist.linux-aarch64/wheel
+INFO: creating build/bdist.linux-aarch64/wheel/cann_bench
+INFO: copying build/lib.linux-aarch64-cpython-311/cann_bench/_C.abi3.so -> build/bdist.linux-aarch64/wheel/./cann_bench
+INFO: copying build/lib.linux-aarch64-cpython-311/cann_bench/__init__.py -> build/bdist.linux-aarch64/wheel/./cann_bench
+INFO: running install_egg_info
+INFO: running egg_info
+INFO: writing cann_bench.egg-info/PKG-INFO
+INFO: writing dependency_links to cann_bench.egg-info/dependency_links.txt
+INFO: writing requirements to cann_bench.egg-info/requires.txt
+INFO: writing top-level names to cann_bench.egg-info/top_level.txt
+INFO: reading manifest file 'cann_bench.egg-info/SOURCES.txt'
+INFO: writing manifest file 'cann_bench.egg-info/SOURCES.txt'
+INFO: Copying cann_bench.egg-info to build/bdist.linux-aarch64/wheel/./cann_bench-1.0.0-py3.11.egg-info
+INFO: running install_scripts
+INFO: creating build/bdist.linux-aarch64/wheel/cann_bench-1.0.0.dist-info/WHEEL
+INFO: creating '/mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/dist/.tmp-wkpz8m__/cann_bench-1.0.0-cp38-abi3-linux_aarch64.whl' and adding 'build/bdist.linux-aarch64/wheel' to it
+INFO: adding 'cann_bench/_C.abi3.so'
+INFO: adding 'cann_bench/__init__.py'
+INFO: adding 'cann_bench-1.0.0.dist-info/METADATA'
+INFO: adding 'cann_bench-1.0.0.dist-info/WHEEL'
+INFO: adding 'cann_bench-1.0.0.dist-info/top_level.txt'
+INFO: adding 'cann_bench-1.0.0.dist-info/RECORD'
+INFO: removing build/bdist.linux-aarch64/wheel
+Successfully built cann_bench-1.0.0-cp38-abi3-linux_aarch64.whl
+=== Wheel package built successfully ===
+Output: /mnt/workspace/my_topo_dispatch_exp/my_ops_pkg/dist/cann_bench-1.0.0-cp38-abi3-linux_aarch64.whl
+
+=== Build complete ===
+total 172
+drwxr-xr-x  2 developer developer   4096 Nov 13 17:09 .
+drwxr-xr-x 10 developer developer   4096 Nov 13 17:08 ..
+-rw-r--r--  1 developer developer 166359 Nov 13 17:09 cann_bench-1.0.0-cp38-abi3-linux_aarch64.whl
